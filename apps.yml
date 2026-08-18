@@ -1,0 +1,24 @@
+---
+# Registry of downstream apps released by the ecosystem orchestrator.
+#
+# Each entry must provide:
+#   repo:              owner/name of the app repository
+#   default_branch:    branch used for stable releases
+#   prerelease_branch: branch used for prerelease releases
+#
+# Adding an app is a data-only change: append an entry here. The app repo
+# must already carry prepare-release.yml and release.yml workflows on both
+# branches (see README.md).
+apps:
+  - repo: netdevops/hier-config-gpt
+    default_branch: develop
+    prerelease_branch: next
+  - repo: netdevops/hier-config-api
+    default_branch: develop
+    prerelease_branch: next
+  - repo: netdevops/hier-config-mcp
+    default_branch: main
+    prerelease_branch: next
+  - repo: netdevops/hier-config-cli
+    default_branch: main
+    prerelease_branch: next

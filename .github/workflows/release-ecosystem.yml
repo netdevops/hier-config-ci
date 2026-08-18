@@ -1,0 +1,184 @@
+---
+name: Release ecosystem
+
+"on":
+  repository_dispatch:
+    types: [hier-config-release]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump to apply to each app
+        type: choice
+        options: [major, minor, patch, prerelease]
+        default: patch
+      channel:
+        description: >-
+          stable releases from each app's default branch; prerelease
+          releases from its prerelease branch
+        type: choice
+        options: [stable, prerelease]
+        default: stable
+      apps:
+        description: >-
+          Comma-separated app filter (repo name or owner/repo); empty
+          releases all apps in apps.yml
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-ecosystem
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      bump: ${{ steps.plan.outputs.bump }}
+      channel: ${{ steps.plan.outputs.channel }}
+    steps:
+      - name: Check ECOSYSTEM_GITHUB_TOKEN is configured
+        env:
+          GH_TOKEN: ${{ secrets.ECOSYSTEM_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::ECOSYSTEM_GITHUB_TOKEN secret is not set." \
+              "Create a PAT with repo+workflow scope (owned by an org" \
+              "admin) and add it as a repository secret. See README.md."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Compute release plan
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_PRERELEASE: ${{ github.event.client_payload.prerelease }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          INPUT_BUMP: ${{ inputs.bump }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
+          INPUT_APPS: ${{ inputs.apps }}
+        run: |
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            echo "Triggered by hier_config v${DISPATCH_VERSION:-unknown}"
+            if [ "$DISPATCH_PRERELEASE" = "true" ]; then
+              channel=prerelease
+              bump=prerelease
+            else
+              channel=stable
+              bump=patch
+            fi
+            filter=""
+          else
+            channel=$INPUT_CHANNEL
+            bump=$INPUT_BUMP
+            filter=$INPUT_APPS
+          fi
+          matrix=$(yq -o=json '.apps' apps.yml | jq -c \
+            --arg channel "$channel" --arg filter "$filter" '
+            ($filter | split(",") | map(gsub("^\\s+|\\s+$"; ""))
+                     | map(select(. != ""))) as $want
+            | map({repo,
+                   branch: (if $channel == "prerelease"
+                            then .prerelease_branch
+                            else .default_branch end)})
+            | map(select(. as $app
+                         | ($app.repo | split("/")[1]) as $short
+                         | ($want | length) == 0
+                           or ($want | index($app.repo)) != null
+                           or ($want | index($short)) != null))')
+          if [ "$(jq 'length' <<<"$matrix")" -eq 0 ]; then
+            echo "::error::No apps in apps.yml matched filter '$filter'"
+            exit 1
+          fi
+          echo "Plan (channel=$channel bump=$bump):"
+          jq . <<<"$matrix"
+          {
+            echo "matrix=$matrix"
+            echo "bump=$bump"
+            echo "channel=$channel"
+          } >>"$GITHUB_OUTPUT"
+
+  release:
+    needs: plan
+    runs-on: ubuntu-latest
+    name: ${{ matrix.repo }} (${{ matrix.branch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      GH_TOKEN: ${{ secrets.ECOSYSTEM_GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release app
+        id: run
+        continue-on-error: true
+        env:
+          APP_REPO: ${{ matrix.repo }}
+          APP_BRANCH: ${{ matrix.branch }}
+          BUMP: ${{ needs.plan.outputs.bump }}
+        run: |
+          set -o pipefail
+          bash scripts/release_app.sh "$APP_REPO" "$APP_BRANCH" "$BUMP" \
+            | tee "$RUNNER_TEMP/release.log"
+
+      - name: Record result
+        if: always()
+        env:
+          APP_REPO: ${{ matrix.repo }}
+          JOB_INDEX: ${{ strategy.job-index }}
+        run: |
+          result=$(grep '^RESULT|' "$RUNNER_TEMP/release.log" \
+            | tail -1 || true)
+          if [ -z "$result" ]; then
+            result="RESULT|$APP_REPO|unknown|n/a|n/a|failed"
+          fi
+          echo "$result" >"result-$JOB_INDEX.txt"
+          IFS='|' read -r _ repo version pr release status <<<"$result"
+          echo "$repo: $version -> $status (PR: $pr, release: $release)" \
+            >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ strategy.job-index }}
+          path: result-${{ strategy.job-index }}.txt
+
+      - name: Fail job if the release failed
+        if: steps.run.outcome == 'failure'
+        run: exit 1
+
+  summary:
+    needs: [plan, release]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          merge-multiple: true
+
+      - name: Write run summary
+        env:
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+          BUMP: ${{ needs.plan.outputs.bump }}
+        run: |
+          {
+            echo "## Ecosystem release summary"
+            echo ""
+            echo "Channel: \`$CHANNEL\` — bump: \`$BUMP\`"
+            echo ""
+            echo "| App | Version | PR | Release | PyPI status |"
+            echo "|-----|---------|----|---------|-------------|"
+            cat result-*.txt | sort |
+              while IFS='|' read -r _ repo version pr release status; do
+                echo "| $repo | $version | $pr | $release | $status |"
+              done
+          } >>"$GITHUB_STEP_SUMMARY"
