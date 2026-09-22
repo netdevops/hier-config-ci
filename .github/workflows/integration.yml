@@ -1,0 +1,166 @@
+---
+name: Integration test
+
+"on":
+  workflow_dispatch:
+    inputs:
+      hier-config:
+        description: >-
+          hier-config version or pip spec to test; empty uses the default
+          from integration.yml
+        type: string
+        default: ""
+      apps:
+        description: >-
+          Comma-separated app filter (short name or owner/repo); empty
+          tests every app in integration.yml
+        type: string
+        default: ""
+      branches:
+        description: >-
+          Branch overrides, comma-separated. Use a bare branch ('next') to
+          apply to every app, or 'app=branch' ('hier-config-cli=next') for
+          one app. Empty uses each app's branch from integration.yml.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      hier_config: ${{ steps.plan.outputs.hier_config }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install the tool
+        run: uv sync --frozen
+
+      - name: Compute integration matrix
+        id: plan
+        env:
+          INPUT_HIER_CONFIG: ${{ inputs.hier-config }}
+          INPUT_APPS: ${{ inputs.apps }}
+          INPUT_BRANCHES: ${{ inputs.branches }}
+        run: |
+          plan_args=()
+          if [ -n "$INPUT_HIER_CONFIG" ]; then
+            plan_args+=(--hier-config "$INPUT_HIER_CONFIG")
+          fi
+          if [ -n "$INPUT_BRANCHES" ]; then
+            plan_args+=(--branch "$INPUT_BRANCHES")
+          fi
+          read -r -a app_args <<<"$INPUT_APPS"
+          matrix=$(uv run hier-config-ci plan --json \
+            "${plan_args[@]}" "${app_args[@]}")
+          if [ "$(jq '.include | length' <<<"$matrix")" -eq 0 ]; then
+            echo "::error::No apps in integration.yml matched filter '$INPUT_APPS'"
+            exit 1
+          fi
+          hier_config=$(jq -r '.hier_config' <<<"$matrix")
+          echo "Plan (hier-config=$hier_config):"
+          jq . <<<"$matrix"
+          {
+            echo "matrix=$matrix"
+            echo "hier_config=$hier_config"
+          } >>"$GITHUB_OUTPUT"
+
+  test:
+    needs: plan
+    runs-on: ubuntu-latest
+    name: ${{ matrix.repo }} (${{ matrix.branch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install poetry
+        run: pipx install poetry
+
+      - name: Install the tool
+        run: uv sync --frozen
+
+      - name: Run integration test
+        id: run
+        continue-on-error: true
+        env:
+          HIER_CONFIG: ${{ needs.plan.outputs.hier_config }}
+          APP_REPO: ${{ matrix.repo }}
+          APP_BRANCH: ${{ matrix.branch }}
+        run: |
+          short=${APP_REPO#*/}
+          uv run hier-config-ci test "$short" \
+            --hier-config "$HIER_CONFIG" \
+            --branch "$short=$APP_BRANCH" \
+            --no-report \
+            --workdir "$RUNNER_TEMP/integration" \
+            || true
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/integration/results
+          if-no-files-found: ignore
+
+      - name: Fail job if the integration failed
+        if: steps.run.outcome == 'failure'
+        run: exit 1
+
+  report:
+    needs: [plan, test]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install the tool
+        run: uv sync --frozen
+
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          merge-multiple: true
+          path: results
+
+      - name: Render report
+        env:
+          HIER_CONFIG: ${{ needs.plan.outputs.hier_config }}
+        run: |
+          uv run hier-config-ci report results \
+            --hier-config "$HIER_CONFIG" \
+            --output report.md
+
+      - name: Write run summary
+        run: cat report.md >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-report
+          path: report.md

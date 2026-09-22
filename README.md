@@ -107,6 +107,74 @@ Actions → **Release ecosystem** → *Run workflow*:
 Example: rerun only the CLI app as a prerelease → bump `prerelease`,
 channel `prerelease`, apps `hier-config-cli`.
 
+## Integration testing
+
+Before (and after) releasing, this repo can validate a hier-config build
+against every downstream app: it clones each app at a chosen branch,
+installs it, replaces its hier-config with the version under test, runs
+the app's own test suite, and writes a Markdown report that defines what
+works and what does not. The registry lives in
+[`integration.yml`](integration.yml); the CLI lives in the
+`hier-config-ci` package.
+
+### Running locally
+
+```bash
+uv run hier-config-ci plan            # show the selection without running
+uv run hier-config-ci test            # clone, install, test, and report
+```
+
+`test` writes one JSON result per app to `.integration/results/` and a
+Markdown report to `.integration/report.md`, and exits non-zero if any
+app failed.
+
+Select the version and the branches:
+
+```bash
+# a specific hier-config build (any pip spec, e.g. a git URL or path)
+uv run hier-config-ci test --hier-config 4.0.0b4
+
+# one branch for every app
+uv run hier-config-ci test --branch next
+
+# per-app branches (repeatable or comma-separated)
+uv run hier-config-ci test --branch hier-config-cli=next,hco-core=master
+
+# a subset of apps
+uv run hier-config-ci test hier-config-cli hier-config-mcp
+
+# re-render a report from existing results
+uv run hier-config-ci report .integration/results --output report.md
+```
+
+Each app's `python`, `install`, `setup`, `test`, and `env` can be
+tuned in `integration.yml`; the `defaults:` block applies to every app.
+
+### Running in GitHub Actions
+
+Actions → **Integration test** → *Run workflow*:
+
+- `hier-config` — version or pip spec under test; empty uses the
+  `hier_config` value from `integration.yml`.
+- `apps` — comma-separated filter; empty tests every app.
+- `branches` — branch overrides (`next` for all, or
+  `hier-config-cli=next`); empty uses each app's `branch` in
+  `integration.yml`.
+
+The workflow runs one job per app (`fail-fast: false`), then aggregates
+the results into a Markdown report. The report is written to the run
+summary and uploaded as the `integration-report` artifact; per-app result
+JSONs are uploaded as `results-*` artifacts.
+
+### Interpreting the report
+
+The summary table marks each app ✅ passed, ❌ failed (with the step that
+failed: install, import, setup, tests, or clone), or ➖ no Python
+package. It also shows the app's declared hier-config pin and whether it
+would accept the version under test — a common finding is a stale pin
+(e.g. `^3.3.0`) that rejects a 4.x release even though the code and tests
+pass once the newer build is forced in.
+
 ## Adding an app
 
 1. Give the app repo the standard workflows on **all** release branches
@@ -151,6 +219,9 @@ channel `prerelease`, apps `hier-config-cli`.
 
 | Path | Purpose |
 |------|---------|
-| `apps.yml` | Declarative app registry (repo + branches). |
+| `apps.yml` | Declarative app registry (repo + branches) for the release orchestrator. |
 | `scripts/release_app.sh` | Full release chain for one app (gh + jq). |
 | `.github/workflows/release-ecosystem.yml` | Orchestrator workflow. |
+| `integration.yml` | Registry (apps, branches, commands) for the integration test. |
+| `hier_config_ci/` | Integration CLI: `plan`, `test`, `report` subcommands. |
+| `.github/workflows/integration.yml` | GitHub Actions integration test workflow. |

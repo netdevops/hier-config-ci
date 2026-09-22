@@ -1,0 +1,61 @@
+---
+# Registry of downstream apps that the integration test runs against one
+# hier-config build. `hier-config-ci plan` shows the effective selection.
+#
+# Top level:
+#   hier_config: default version under test (override with --hier-config)
+#   defaults:    values applied to every app unless the app sets its own
+#
+# Each app:
+#   repo:    owner/name of the app repository
+#   branch:  branch to test (override with --branch name=branch, or
+#            --branch <branch> for every app)
+#   python:  Python minor version for the app environment
+#   module:  import name checked after hier-config is replaced (optional)
+#   install: command that installs the app and its test dependencies
+#   setup:   commands that run after the install and before the tests
+#   test:    the test command; its exit code decides pass or fail
+#   env:     extra environment variables; {venv_python} expands to the
+#            interpreter of the app environment
+hier_config: 4.0.0b4
+
+defaults:
+  python: "3.12"
+  install: poetry install --no-interaction
+  test: poetry run pytest -q -rfE -o addopts=""
+
+apps:
+  - repo: netdevops/hco-core
+    branch: develop
+    module: hco_core
+
+  - repo: netdevops/hier-config-ai
+    branch: next
+    module: hier_config_ai
+    install: poetry install --no-interaction --with dev,evals --all-extras
+
+  - repo: netdevops/hier-config-orchestrator
+    branch: develop
+
+  - repo: netdevops/hier-config-api
+    branch: next
+    module: hier_config_api
+
+  - repo: netdevops/hier-config-cli
+    branch: next
+    module: hier_config_cli
+
+  - repo: netdevops/hier-config-mcp
+    branch: next
+    module: hier_config_mcp
+
+  - repo: netdevops/hconfig-remediation-ansible
+    branch: next
+    python: "3.11"
+    install: poetry install --no-interaction --no-root
+    setup:
+      - poetry run ansible-galaxy collection build --force --output-path dist
+      - poetry run ansible-galaxy collection install --force dist/*.tar.gz
+    test: poetry run pytest -q -rfE --maxfail=3 --disable-warnings
+    env:
+      ANSIBLE_PYTHON_INTERPRETER: "{venv_python}"
